@@ -1,0 +1,1184 @@
+!pip install -q transformers streamlit opencv-python
+
+import os, random, math
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+from transformers import ViTImageProcessor, ViTForImageClassification
+
+print("Torch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+zip_path = "/content/diabetic.zip"         
+root_dir = "/content/diabetic_data"         
+
+import zipfile
+
+os.makedirs(root_dir, exist_ok=True)
+with zipfile.ZipFile(zip_path, 'r') as zf:
+    zf.extractall(root_dir)
+
+print("Розпаковано у:", root_dir)
+!find /content/diabetic_data -maxdepth 2 -type d
+import os
+from torch.utils.data import Dataset, DataLoader, random_split
+from PIL import Image
+from transformers import ViTImageProcessor
+
+DATA_ROOT = "/content/diabetic_data"  
+
+processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+
+print("Підпапки (класи) в DATA_ROOT:", os.listdir(DATA_ROOT))
+class FundusDataset(Dataset):
+    def __init__(self, root_dir, processor):
+        self.root_dir = root_dir
+        self.processor = processor
+        self.img_paths = []
+        self.labels = []
+
+        if not os.path.exists(root_dir):
+            raise FileNotFoundError(f"root_dir не існує: {root_dir}")
+            
+        self.class_names = sorted([
+            d for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        ])
+
+        if not self.class_names:
+            raise RuntimeError(f"У каталозі {root_dir} немає підпапок-класів.")
+
+        name_to_label = {name: i for i, name in enumerate(self.class_names)}
+
+        for cls_name in self.class_names:
+            cls_dir = os.path.join(root_dir, cls_name)
+            for fname in os.listdir(cls_dir):
+                if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')):
+                    self.img_paths.append(os.path.join(cls_dir, fname))
+                    self.labels.append(name_to_label[cls_name])
+
+        if not self.img_paths:
+            raise RuntimeError(f"У {root_dir} не знайдено жодного зображення допустимих форматів.")
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        label = self.labels[idx]
+
+        image = Image.open(img_path).convert("RGB")
+        encoding = self.processor(images=image, return_tensors="pt")
+        pixel_values = encoding["pixel_values"].squeeze(0)
+
+        return {
+            "pixel_values": pixel_values,
+            "labels": torch.tensor(label, dtype=torch.long),
+            "path": img_path
+        }
+full_dataset = FundusDataset(DATA_ROOT, processor)
+
+val_ratio = 0.2
+val_len = max(1, int(len(full_dataset) * val_ratio))
+train_len = len(full_dataset) - val_len
+
+generator = torch.Generator().manual_seed(42)  
+train_dataset, val_dataset = random_split(
+    full_dataset,
+    [train_len, val_len],
+    generator=generator
+)
+
+print("Класи:", full_dataset.class_names)
+print("Train samples:", len(train_dataset))
+print("Val samples:", len(val_dataset))
+
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+val_loader   = DataLoader(val_dataset, batch_size=8, shuffle=False)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+NUM_CLASSES = len(full_dataset.class_names)
+id2label = {i: name for i, name in enumerate(full_dataset.class_names)}
+label2id = {name: i for i, name in enumerate(full_dataset.class_names)}
+
+from transformers import ViTForImageClassification
+
+model = ViTForImageClassification.from_pretrained(
+    "google/vit-base-patch16-224",
+    num_labels=NUM_CLASSES,
+    id2label=id2label,
+    label2id=label2id,
+    ignore_mismatched_sizes=True
+).to(device)
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-5)
+!pip install -q scikit-learn matplotlib
+
+import os
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, Subset
+
+from PIL import Image
+import matplotlib.pyplot as plt
+
+from transformers import ViTImageProcessor, ViTForImageClassification
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    confusion_matrix,
+    classification_report,
+    cohen_kappa_score
+)
+from collections import Counter
+DATA_ROOT = "/content/diabetic_data"   # твоя структура з Healthy/Mild/...
+
+processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+
+class FundusDataset(Dataset):
+    def __init__(self, root_dir, processor):
+        self.root_dir = root_dir
+        self.processor = processor
+        self.img_paths = []
+        self.labels = []
+
+        if not os.path.exists(root_dir):
+            raise FileNotFoundError(f"root_dir не існує: {root_dir}")
+
+        # назви класів = назви підпапок
+        self.class_names = sorted([
+            d for d in os.listdir(root_dir)
+            if os.path.isdir(os.path.join(root_dir, d))
+        ])
+
+        if not self.class_names:
+            raise RuntimeError(f"У каталозі {root_dir} немає підпапок-класів.")
+
+        name_to_label = {name: i for i, name in enumerate(self.class_names)}
+
+        for cls_name in self.class_names:
+            cls_dir = os.path.join(root_dir, cls_name)
+            for fname in os.listdir(cls_dir):
+                if fname.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff')):
+                    self.img_paths.append(os.path.join(cls_dir, fname))
+                    self.labels.append(name_to_label[cls_name])
+
+        if not self.img_paths:
+            raise RuntimeError(f"У {root_dir} не знайдено жодного зображення допустимих форматів.")
+
+    def __len__(self):
+        return len(self.img_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.img_paths[idx]
+        label = self.labels[idx]
+
+        image = Image.open(img_path).convert("RGB")
+        # ЛИШЕ стандартна підготовка ViT (resize/center crop/нормалізація)
+        enc = self.processor(images=image, return_tensors="pt")
+        pixel_values = enc["pixel_values"].squeeze(0)
+
+        return {
+            "pixel_values": pixel_values,
+            "labels": torch.tensor(label, dtype=torch.long),
+            "path": img_path
+        }
+
+full_dataset = FundusDataset(DATA_ROOT, processor)
+print("Класи:", full_dataset.class_names)
+print("Усього зображень:", len(full_dataset))
+indices = np.arange(len(full_dataset))
+labels_all = np.array(full_dataset.labels)
+
+train_idx, val_idx = train_test_split(
+    indices,
+    test_size=0.2,
+    random_state=42,
+    stratify=labels_all
+)
+
+train_dataset = Subset(full_dataset, train_idx)
+val_dataset   = Subset(full_dataset, val_idx)
+
+print("Train size:", len(train_dataset))
+print("Val size  :", len(val_dataset))
+
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+val_loader   = DataLoader(val_dataset,   batch_size=16, shuffle=False)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+class_names = full_dataset.class_names
+NUM_CLASSES = len(class_names)
+id2label = {i: name for i, name in enumerate(class_names)}
+label2id = {name: i for i, name in enumerate(class_names)}
+
+model = ViTForImageClassification.from_pretrained(
+    "google/vit-base-patch16-224",
+    num_labels=NUM_CLASSES,
+    id2label=id2label,
+    label2id=label2id,
+    ignore_mismatched_sizes=True
+).to(device)
+
+# ваги класів за train-частиною
+train_labels_only = labels_all[train_idx]
+from collections import Counter
+cnt = Counter(train_labels_only)
+total = sum(cnt.values())
+class_weights_list = [total / cnt[i] for i in range(NUM_CLASSES)]
+class_weights = torch.tensor(class_weights_list, dtype=torch.float).to(device)
+
+print("class_weights:", class_weights_list)
+
+loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=1e-5,
+    weight_decay=0.01
+)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=2
+)
+def run_epoch(model, dataloader, device, loss_fn, train=True):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    all_labels = []
+    all_preds = []
+
+    for batch in dataloader:
+        pixel_values = batch["pixel_values"].to(device)
+        labels = batch["labels"].to(device)
+
+        with torch.set_grad_enabled(train):
+            outputs = model(pixel_values=pixel_values)
+            logits = outputs.logits
+            loss = loss_fn(logits, labels)
+
+        if train:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        total_loss += loss.item() * labels.size(0)
+
+        preds = logits.argmax(dim=-1)
+        all_labels.extend(labels.cpu().numpy())
+        all_preds .extend(preds.cpu().numpy())
+
+    all_labels = np.array(all_labels)
+    all_preds  = np.array(all_preds)
+
+    avg_loss = total_loss / len(all_labels)
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average='macro')
+    qwk = cohen_kappa_score(all_labels, all_preds, weights='quadratic')
+
+    return avg_loss, acc, f1, qwk, all_labels, all_preds
+EPOCHS = 15 
+
+history = {
+    "train_loss": [],
+    "val_loss": [],
+    "train_acc": [],
+    "val_acc": [],
+    "train_f1": [],
+    "val_f1": [],
+    "train_qwk": [],
+    "val_qwk": [],
+}
+
+best_val_acc = 0.0
+best_val_labels = None
+best_val_preds = None
+
+for epoch in range(1, EPOCHS + 1):
+    train_loss, train_acc, train_f1, train_qwk, _, _ = run_epoch(
+        model, train_loader, device, loss_fn, train=True
+    )
+    val_loss, val_acc, val_f1, val_qwk, val_labels_np, val_preds_np = run_epoch(
+        model, val_loader, device, loss_fn, train=False
+    )
+
+    scheduler.step(val_loss)
+
+    history["train_loss"].append(train_loss)
+    history["val_loss"].append(val_loss)
+    history["train_acc"].append(train_acc)
+    history["val_acc"].append(val_acc)
+    history["train_f1"].append(train_f1)
+    history["val_f1"].append(val_f1)
+    history["train_qwk"].append(train_qwk)
+    history["val_qwk"].append(val_qwk)
+
+    print(f"Епоха {epoch:02d}:")
+    print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.4f}, F1={train_f1:.4f}, QWK={train_qwk:.4f}")
+    print(f"  Val  : loss={val_loss:.4f}, acc={val_acc:.4f}, F1={val_f1:.4f}, QWK={val_qwk:.4f}")
+
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_val_labels = val_labels_np
+        best_val_preds  = val_preds_np
+        model.save_pretrained("vit_dr_model")
+        processor.save_pretrained("vit_dr_model")
+        print("  >>> Збережено найкращу модель (vit_dr_model)")
+epochs_range = range(1, EPOCHS + 1)
+
+plt.figure(figsize=(6,4))
+plt.plot(epochs_range, history["train_loss"], label="Train loss")
+plt.plot(epochs_range, history["val_loss"],   label="Val loss")
+plt.xlabel("Епоха")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+plt.title("Train / Val Loss")
+plt.show()
+
+plt.figure(figsize=(6,4))
+plt.plot(epochs_range, history["train_acc"], label="Train acc")
+plt.plot(epochs_range, history["val_acc"],   label="Val acc")
+plt.xlabel("Епоха")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+plt.title("Train / Val Accuracy")
+plt.show()
+
+plt.figure(figsize=(6,4))
+plt.plot(epochs_range, history["train_f1"], label="Train macro-F1")
+plt.plot(epochs_range, history["val_f1"],   label="Val macro-F1")
+plt.xlabel("Епоха")
+plt.ylabel("Macro-F1")
+plt.legend()
+plt.grid(True)
+plt.title("Train / Val Macro-F1")
+plt.show()
+
+plt.figure(figsize=(6,4))
+plt.plot(epochs_range, history["train_qwk"], label="Train QWK")
+plt.plot(epochs_range, history["val_qwk"],   label="Val QWK")
+plt.xlabel("Епоха")
+plt.ylabel("Quadratic Weighted Kappa")
+plt.legend()
+plt.grid(True)
+plt.title("Train / Val QWK")
+plt.show()
+from pprint import pprint
+
+print("Найкраща val accuracy:", best_val_acc)
+
+cm = confusion_matrix(best_val_labels, best_val_preds)
+print("Confusion matrix (raw counts):")
+print(cm)
+
+plt.figure(figsize=(6,5))
+im = plt.imshow(cm, cmap="Blues")
+plt.colorbar(im)
+plt.xticks(range(NUM_CLASSES), class_names, rotation=45, ha="right")
+plt.yticks(range(NUM_CLASSES), class_names)
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix (Val)")
+for i in range(NUM_CLASSES):
+    for j in range(NUM_CLASSES):
+        plt.text(j, i, str(cm[i, j]), ha="center", va="center", color="black")
+plt.tight_layout()
+plt.show()
+
+print("\nClassification report:")
+print(classification_report(
+    best_val_labels,
+    best_val_preds,
+    target_names=class_names,
+    digits=4
+))
+!pip install -q transformers ipywidgets opencv-python
+
+import torch
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import cv2
+from io import BytesIO
+
+from transformers import ViTForImageClassification, ViTImageProcessor
+
+import ipywidgets as widgets
+from IPython.display import display
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+model_dir = "vit_dr_model" 
+
+model = ViTForImageClassification.from_pretrained(model_dir)
+
+
+if hasattr(model, "set_attn_implementation"):
+    model.set_attn_implementation("eager")
+    print("Увімкнено attn_implementation = 'eager'")
+else:
+    print("Увага: у цій версії transformers немає set_attn_implementation; attention rollout може не працювати.")
+
+processor = ViTImageProcessor.from_pretrained(model_dir)
+model.to(device)
+model.eval()
+
+class_names = [model.config.id2label[i] for i in range(model.config.num_labels)]
+print("Класи моделі:", class_names)
+
+
+@torch.no_grad()
+def generate_attention_rollout(model, pixel_values):
+    """
+    Attention rollout для ViT:
+    агрегуємо self-attention з усіх шарів і дістаємо важливість патчів
+    відносно CLS-токена.
+    """
+    outputs = model(pixel_values=pixel_values, output_attentions=True)
+    attentions = outputs.attentions 
+
+    if attentions is None:
+        raise RuntimeError(
+            "Модель не повернула attentions. "
+            "Перевір, що викликано model.set_attn_implementation('eager') "
+            "перед інференсом."
+        )
+
+   
+    att_mat = torch.stack(attentions)  
+    att_mat = att_mat.squeeze(1)     
+    L, H, T, _ = att_mat.shape
+
+   
+    att_mat = att_mat.mean(dim=1)      
+
+   
+    eye = torch.eye(T, device=att_mat.device)
+    att_mat = att_mat + eye[None, :, :]
+    att_mat = att_mat / att_mat.sum(dim=-1, keepdim=True)
+
+    joint_att = att_mat[0]
+    for i in range(1, L):
+        joint_att = att_mat[i] @ joint_att 
+
+    
+    v = joint_att[0, 1:]                   
+    num_patches = v.shape[0]
+    size = int(num_patches ** 0.5)
+    v = v.reshape(size, size).cpu().numpy()
+    v = v / (v.max() + 1e-6)
+    return v  
+
+def apply_colormap_on_image(org_im: Image.Image, activation: np.ndarray, alpha: float = 0.45):
+    """
+    Накладає карту уваги на зображення.
+    """
+    org_im = org_im.resize((224, 224))
+    img = np.array(org_im)
+
+    act_resized = cv2.resize(activation, (img.shape[1], img.shape[0]))
+    heatmap = cv2.applyColorMap(np.uint8(255 * act_resized), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+    overlayed = np.uint8(alpha * heatmap + (1 - alpha) * img)
+    return Image.fromarray(overlayed)
+
+
+
+upload = widgets.FileUpload(
+    accept='image/*',
+    multiple=False,
+    description='Завантажити зображення очного дна'
+)
+
+out = widgets.Output()
+
+def on_upload_change(change):
+    out.clear_output()
+    if not upload.value:
+        return
+
+
+    (fname, file_info), = upload.value.items()
+    img_bytes = file_info['content']
+    image = Image.open(BytesIO(img_bytes)).convert("RGB")
+
+ 
+    enc = processor(images=image, return_tensors="pt")
+    pixel_values = enc["pixel_values"].to(device)
+
+    with torch.no_grad():
+        outputs = model(pixel_values=pixel_values)
+        logits = outputs.logits
+        probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+
+    pred_idx = int(np.argmax(probs))
+    pred_label = class_names[pred_idx]
+    pred_prob  = float(probs[pred_idx])
+
+
+    att_map = generate_attention_rollout(model, pixel_values)
+    explained_img = apply_colormap_on_image(image, att_map, alpha=0.45)
+
+    with out:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        axes[0].imshow(image)
+        axes[0].set_title("Вхідне зображення")
+        axes[0].axis("off")
+
+        axes[1].imshow(explained_img)
+        axes[1].set_title("Зони уваги ViT")
+        axes[1].axis("off")
+
+        plt.show()
+
+        print(f"Передбачений клас: {pred_label}")
+        print(f"Ймовірність: {pred_prob:.3f}")
+        print("\nРозподіл ймовірностей по класах:")
+        for name, p in zip(class_names, probs):
+            print(f"  {name:15s} : {p:.3f}")
+
+upload.observe(on_upload_change, names='value')
+
+display(widgets.VBox([upload, out]))
+!pip install -q transformers scikit-learn matplotlib
+
+import os
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
+from PIL import Image
+import matplotlib.pyplot as plt
+
+from transformers import ViTImageProcessor, ViTForImageClassification
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, classification_report
+from collections import Counter
+DATA_ROOT = "/content/diabetic_data"   # як у тебе: Healthy / Mild DR / ...
+
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+
+all_paths_bin = []
+all_labels_bin = []   # 0 = немає патології (Healthy), 1 = є патологія (будь-який DR)
+
+for cls_name in os.listdir(DATA_ROOT):
+    cls_dir = os.path.join(DATA_ROOT, cls_name)
+    if not os.path.isdir(cls_dir):
+        continue
+
+    for fname in os.listdir(cls_dir):
+        if fname.lower().endswith(IMG_EXTS):
+            all_paths_bin.append(os.path.join(cls_dir, fname))
+            label = 0 if cls_name == "Healthy" else 1
+            all_labels_bin.append(label)
+
+all_paths_bin = np.array(all_paths_bin)
+all_labels_bin = np.array(all_labels_bin)
+
+print("Усього зображень (binary):", len(all_paths_bin))
+print("Розподіл класів 0/1:", Counter(all_labels_bin))
+processor_bin = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+
+class FundusBinaryDataset(Dataset):
+    def __init__(self, paths, labels, processor):
+        self.paths = list(paths)
+        self.labels = list(labels)
+        self.processor = processor
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img_path = self.paths[idx]
+        label = int(self.labels[idx])
+
+        image = Image.open(img_path).convert("RGB")
+        enc = self.processor(images=image, return_tensors="pt")
+        pixel_values = enc["pixel_values"].squeeze(0)
+
+        return {
+            "pixel_values": pixel_values,
+            "labels": torch.tensor(label, dtype=torch.long),
+            "path": img_path
+        }
+
+train_paths_bin, val_paths_bin, train_labels_bin, val_labels_bin = train_test_split(
+    all_paths_bin,
+    all_labels_bin,
+    test_size=0.2,
+    random_state=42,
+    stratify=all_labels_bin
+)
+
+print("Train size (binary):", len(train_paths_bin))
+print("Val size (binary):", len(val_paths_bin))
+
+train_bin_dataset = FundusBinaryDataset(train_paths_bin, train_labels_bin, processor_bin)
+val_bin_dataset   = FundusBinaryDataset(val_paths_bin,   val_labels_bin,   processor_bin)
+
+train_bin_loader = DataLoader(train_bin_dataset, batch_size=16, shuffle=True)
+val_bin_loader   = DataLoader(val_bin_dataset,   batch_size=16, shuffle=False)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+id2label_bin = {0: "No_pathology", 1: "Pathology"}
+label2id_bin = {"No_pathology": 0, "Pathology": 1}
+
+model_bin = ViTForImageClassification.from_pretrained(
+    "google/vit-base-patch16-224",
+    num_labels=2,
+    id2label=id2label_bin,
+    label2id=label2id_bin,
+    ignore_mismatched_sizes=True
+).to(device)
+
+
+cnt_bin = Counter(train_labels_bin)
+total_bin = sum(cnt_bin.values())
+class_weights_bin_list = [total_bin / cnt_bin[i] for i in range(2)]
+class_weights_bin = torch.tensor(class_weights_bin_list, dtype=torch.float).to(device)
+
+print("class_weights (binary):", class_weights_bin_list)
+
+loss_fn_bin = nn.CrossEntropyLoss(weight=class_weights_bin)
+
+optimizer_bin = torch.optim.AdamW(
+    model_bin.parameters(),
+    lr=1e-5,
+    weight_decay=0.01
+)
+
+scheduler_bin = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer_bin,
+    mode='min',
+    factor=0.5,
+    patience=1
+)
+def run_epoch_bin(model, dataloader, device, loss_fn, train=True):
+    if train:
+        model.train()
+    else:
+        model.eval()
+
+    total_loss = 0.0
+    all_labels = []
+    all_preds  = []
+
+    for batch in dataloader:
+        pixel_values = batch["pixel_values"].to(device)
+        labels = batch["labels"].to(device)
+
+        with torch.set_grad_enabled(train):
+            outputs = model(pixel_values=pixel_values)
+            logits = outputs.logits
+            loss = loss_fn(logits, labels)
+
+        if train:
+            optimizer_bin.zero_grad()
+            loss.backward()
+            optimizer_bin.step()
+
+        total_loss += loss.item() * labels.size(0)
+        preds = logits.argmax(dim=-1)
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(preds.cpu().numpy())
+
+    all_labels = np.array(all_labels)
+    all_preds  = np.array(all_preds)
+
+    avg_loss = total_loss / len(all_labels)
+    acc = accuracy_score(all_labels, all_preds)
+    f1 = f1_score(all_labels, all_preds, average="binary")
+
+    return avg_loss, acc, f1, all_labels, all_preds
+EPOCHS_BIN = 3
+
+hist_bin = {
+    "train_loss": [],
+    "val_loss": [],
+    "train_acc": [],
+    "val_acc": [],
+    "train_f1": [],
+    "val_f1": [],
+}
+
+best_val_acc_bin = 0.0
+best_val_labels_bin = None
+best_val_preds_bin = None
+
+for epoch in range(1, EPOCHS_BIN + 1):
+    train_loss, train_acc, train_f1, _, _ = run_epoch_bin(
+        model_bin, train_bin_loader, device, loss_fn_bin, train=True
+    )
+    val_loss, val_acc, val_f1, val_labels_np, val_preds_np = run_epoch_bin(
+        model_bin, val_bin_loader, device, loss_fn_bin, train=False
+    )
+
+    scheduler_bin.step(val_loss)
+
+    hist_bin["train_loss"].append(train_loss)
+    hist_bin["val_loss"].append(val_loss)
+    hist_bin["train_acc"].append(train_acc)
+    hist_bin["val_acc"].append(val_acc)
+    hist_bin["train_f1"].append(train_f1)
+    hist_bin["val_f1"].append(val_f1)
+
+    print(f"[BINARY] Епоха {epoch}:")
+    print(f"  Train: loss={train_loss:.4f}, acc={train_acc:.4f}, F1={train_f1:.4f}")
+    print(f"  Val  : loss={val_loss:.4f}, acc={val_acc:.4f}, F1={val_f1:.4f}")
+
+    if val_acc > best_val_acc_bin:
+        best_val_acc_bin = val_acc
+        best_val_labels_bin = val_labels_np
+        best_val_preds_bin  = val_preds_np
+        model_bin.save_pretrained("vit_dr_binary")
+        processor_bin.save_pretrained("vit_dr_binary")
+        print("  >>> Збережено найкращу binary-модель (vit_dr_binary)")
+epochs_range = range(1, EPOCHS_BIN + 1)
+
+plt.figure(figsize=(5,4))
+plt.plot(epochs_range, hist_bin["train_loss"], label="Train loss")
+plt.plot(epochs_range, hist_bin["val_loss"],   label="Val loss")
+plt.xlabel("Епоха")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+plt.title("Binary: Train / Val Loss")
+plt.show()
+
+plt.figure(figsize=(5,4))
+plt.plot(epochs_range, hist_bin["train_acc"], label="Train acc")
+plt.plot(epochs_range, hist_bin["val_acc"],   label="Val acc")
+plt.xlabel("Епоха")
+plt.ylabel("Accuracy")
+plt.legend()
+plt.grid(True)
+plt.title("Binary: Train / Val Accuracy")
+plt.show()
+cm_bin = confusion_matrix(best_val_labels_bin, best_val_preds_bin)
+print("Confusion matrix (binary):")
+print(cm_bin)
+
+plt.figure(figsize=(4,4))
+im = plt.imshow(cm_bin, cmap="Blues")
+plt.colorbar(im)
+plt.xticks([0,1], ["No_pathology", "Pathology"])
+plt.yticks([0,1], ["No_pathology", "Pathology"])
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Binary Confusion Matrix (Val)")
+for i in range(2):
+    for j in range(2):
+        plt.text(j, i, str(cm_bin[i, j]), ha="center", va="center", color="black")
+plt.tight_layout()
+plt.show()
+
+print("\nClassification report (binary):")
+print(classification_report(
+    best_val_labels_bin,
+    best_val_preds_bin,
+    target_names=["No_pathology", "Pathology"],
+    digits=4
+))
+!pip install -q flask transformers opencv-python
+
+import base64
+import io
+import threading
+
+from flask import Flask, render_template_string, request
+
+import torch
+import numpy as np
+from PIL import Image
+import cv2
+from transformers import ViTForImageClassification, ViTImageProcessor
+
+from google.colab.output import eval_js
+
+
+BINARY_MODEL_DIR = "vit_dr_binary"  
+MULTI_MODEL_DIR  = "vit_dr_model" 
+PATHOLOGY_THRESHOLD = 0.5           
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+app = Flask(__name__)
+
+def load_models():
+    bin_model = ViTForImageClassification.from_pretrained(BINARY_MODEL_DIR)
+    bin_processor = ViTImageProcessor.from_pretrained(BINARY_MODEL_DIR)
+    bin_model.to(device)
+    bin_model.eval()
+    bin_class_names = [bin_model.config.id2label[i]
+                       for i in range(bin_model.config.num_labels)]
+
+   
+    multi_model = ViTForImageClassification.from_pretrained(MULTI_MODEL_DIR)
+    multi_processor = ViTImageProcessor.from_pretrained(MULTI_MODEL_DIR)
+
+    if hasattr(multi_model, "set_attn_implementation"):
+        multi_model.set_attn_implementation("eager")
+
+    multi_model.to(device)
+    multi_model.eval()
+    multi_class_names = [multi_model.config.id2label[i]
+                         for i in range(multi_model.config.num_labels)]
+
+    return bin_model, bin_processor, bin_class_names, \
+           multi_model, multi_processor, multi_class_names
+
+bin_model, bin_processor, bin_class_names, \
+multi_model, multi_processor, multi_class_names = load_models()
+
+def overlay_heatmap(image: Image.Image, activation: np.ndarray,
+                    alpha: float = 0.45) -> Image.Image:
+    """Накласти теплову карту на зображення."""
+    base = image.resize((224, 224))
+    img = np.array(base)
+
+    act_resized = cv2.resize(activation, (img.shape[1], img.shape[0]))
+    heatmap = cv2.applyColorMap(np.uint8(255 * act_resized), cv2.COLORMAP_JET)
+    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
+    overlayed = np.uint8(alpha * heatmap + (1 - alpha) * img)
+    return Image.fromarray(overlayed)
+
+def pil_to_base64(img: Image.Image) -> str:
+    """Кодує PIL-зображення у base64 для вставки в HTML."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    data = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return data
+
+
+TEMPLATE = """
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <title>Інтелектуальна система класифікації діабетичної ретинопатії</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+    h1 { color: #1a4b82; }
+    h2 { color: #2b6ca3; margin-top: 1.5em; }
+    .card {
+      background: #ffffff;
+      border-radius: 10px;
+      padding: 16px 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+    }
+    .grid { display: flex; flex-wrap: wrap; gap: 20px; }
+    .col  { flex: 1 1 45%; }
+    img {
+      max-width: 100%;
+      border-radius: 8px;
+      border: 1px solid #ddd;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 8px;
+    }
+    th, td {
+      padding: 6px 8px;
+      border: 1px solid #ccc;
+      text-align: left;
+      font-size: 14px;
+    }
+    th { background-color: #e9f1fb; }
+    .btn {
+      background-color: #1a4b82;
+      color: white;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .btn:hover { background-color: #163e6a; }
+    .badge-ok {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: #e3f7e3;
+      color: #216b21;
+      font-size: 13px;
+      font-weight: bold;
+    }
+    .badge-warn {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: #ffe8e8;
+      color: #b12b2b;
+      font-size: 13px;
+      font-weight: bold;
+    }
+    .small { font-size: 13px; color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Нейромережева система поясненої класифікації діабетичної ретинопатії</h1>
+
+  <!-- Завантаження зображення -->
+  <div class="card">
+    <h2>Завантаження зображення очного дна</h2>
+    <form method="POST" enctype="multipart/form-data">
+      <p>Оберіть файл із зображенням очного дна (fundus photo):</p>
+      <input type="file" name="image" accept="image/*" required>
+      <button class="btn" type="submit">Аналізувати</button>
+    </form>
+    <p class="small">
+      Крок 1 – скринінг на наявність патології (binary ViT).<br>
+      Крок 2 – деталізація стадії DR та пояснення рішення (multi-class ViT + attention rollout).
+      Результати є орієнтовними та не замінюють огляд офтальмолога.
+    </p>
+  </div>
+
+  {% if result_available %}
+    <!-- Скринінг: є / немає патології -->
+    <div class="card">
+      <h2>Скринінг: «є патологія / немає патології»</h2>
+      <p>
+        Ймовірність <b>«немає патології»</b>: {{ prob_no_pathology }}<br>
+        Ймовірність <b>«є патологія»</b>: {{ prob_pathology }}<br>
+        Рішення скринінгу:
+        {% if pathology_flag %}
+          <span class="badge-warn">ВИЯВЛЕНО МОЖЛИВУ ПАТОЛОГІЮ</span>
+        {% else %}
+          <span class="badge-ok">ПАТОЛОГІЯ НЕ ВИЯВЛЕНА (за даними моделі)</span>
+        {% endif %}
+      </p>
+    </div>
+
+    <!-- Візуалізація знімка та пояснення -->
+    <div class="card">
+      <h2>Візуалізація знімка та пояснення</h2>
+      <div class="grid">
+        <div class="col">
+          <h3>Оригінальний знімок очного дна</h3>
+          <img src="data:image/png;base64,{{ original_image }}" alt="Original fundus">
+        </div>
+        {% if pathology_flag and attention_image %}
+          <div class="col">
+            <h3>Зони уваги ViT (attention rollout)</h3>
+            <img src="data:image/png;base64,{{ attention_image }}" alt="Attention heatmap">
+          </div>
+        {% endif %}
+      </div>
+      <p class="small">
+        Теплова карта показує ділянки, які модель вважає найбільш інформативними для класифікації.
+        Це ілюструє роботу нейромережі, але не є прямим клінічним маркером.
+      </p>
+    </div>
+
+    <!-- Деталізація типу DR (завжди, для будь-якого класу) -->
+    <div class="card">
+      <h2>Деталізація типу діабетичної ретинопатії</h2>
+      <p>
+        Передбачений клас DR: <b>{{ multi_pred_label }}</b><br>
+        Ймовірність цього класу: {{ multi_pred_prob }}
+      </p>
+      <h3>Розподіл ймовірностей по класах</h3>
+      <table>
+        <tr><th>Клас</th><th>Ймовірність</th></tr>
+        {% for name, prob in multi_probs %}
+          {% set is_best = (loop.index0 == multi_pred_idx) %}
+          <tr>
+            <td>
+              {% if is_best and pathology_flag %}
+                <span style="color:red; font-weight:bold;">{{ name }}</span>
+              {% elif is_best and not pathology_flag %}
+                <span style="color:green; font-weight:bold;">{{ name }}</span>
+              {% else %}
+                {{ name }}
+              {% endif %}
+            </td>
+            <td>
+              {% if is_best and pathology_flag %}
+                <span style="color:red; font-weight:bold;">{{ prob }}</span>
+              {% elif is_best and not pathology_flag %}
+                <span style="color:green; font-weight:bold;">{{ prob }}</span>
+              {% else %}
+                {{ prob }}
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </table>
+
+      {% if recommendation_text %}
+        <p>
+          <b>Коротка рекомендація (інформаційний характер):</b><br>
+          {{ recommendation_text }}
+        </p>
+      {% endif %}
+      <p class="small">
+        Застереження: рекомендація сформована автоматизовано за результатами моделі
+        і не є медичним діагнозом або призначенням лікування. Остаточне рішення
+        щодо стану сітківки приймає лікар-офтальмолог.
+      </p>
+    </div>
+  {% endif %}
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    if request.method == "POST":
+        file = request.files.get("image")
+        if not file or file.filename == "":
+            return render_template_string(TEMPLATE, result_available=False)
+
+        image = Image.open(file.stream).convert("RGB")
+
+
+        enc_bin = bin_processor(images=image, return_tensors="pt")
+        pix_bin = enc_bin["pixel_values"].to(device)
+
+        with torch.no_grad():
+            out_bin = bin_model(pixel_values=pix_bin)
+            logits_bin = out_bin.logits
+            probs_bin = torch.softmax(logits_bin, dim=-1).cpu().numpy()[0]
+
+        prob_no_path = float(probs_bin[0])
+        prob_path    = float(probs_bin[1])
+        pathology_flag = prob_path >= PATHOLOGY_THRESHOLD  
+
+        original_b64 = pil_to_base64(image)
+
+       
+        enc_multi = multi_processor(images=image, return_tensors="pt")
+        pix_multi = enc_multi["pixel_values"].to(device)
+
+        attention_b64 = None
+        multi_probs_list = []
+        multi_pred_label = None
+        multi_pred_prob  = None
+        multi_pred_idx   = None
+        recommendation_text = None
+
+        with torch.no_grad():
+            out_multi = multi_model(pixel_values=pix_multi, output_attentions=True)
+            logits_multi = out_multi.logits
+            probs_multi = torch.softmax(logits_multi, dim=-1).cpu().numpy()[0]
+            att = out_multi.attentions
+
+        multi_pred_idx = int(np.argmax(probs_multi))
+        multi_pred_label = multi_class_names[multi_pred_idx]
+        multi_pred_prob  = float(probs_multi[multi_pred_idx])
+
+        for name, p in zip(multi_class_names, probs_multi):
+            multi_probs_list.append((name, f"{p:.3f}"))
+
+        rec_map = {
+            "Healthy": (
+                "Модель не виявляє ознак діабетичної ретинопатії. "
+                "Рекомендовано дотримуватися планових профілактичних оглядів "
+                "та контролювати рівень глюкози відповідно до призначень лікаря."
+            ),
+            "Mild DR": (
+                "Можливі ранні ознаки діабетичної ретинопатії. "
+                "Бажано найближчим часом звернутися до офтальмолога для очного огляду "
+                "та, за потреби, корекції лікування діабету."
+            ),
+            "Moderate DR": (
+                "Ознаки помірної діабетичної ретинопатії. "
+                "Рекомендована консультація офтальмолога в найкоротший термін "
+                "для уточнення ступеня ураження сітківки та вибору тактики спостереження."
+            ),
+            "Severe DR": (
+                "Ознаки тяжкої діабетичної ретинопатії. "
+                "Необхідний терміновий огляд у офтальмолога або ретинолога, "
+                "може знадобитися направлення до спеціалізованого центру."
+            ),
+            "Proliferate DR": (
+                "Можливі прояви проліферативної діабетичної ретинопатії, "
+                "що потенційно загрожує зору. "
+                "Рекомендовано невідкладно звернутися до офтальмолога "
+                "для поглибленого обстеження та обговорення варіантів лікування."
+            ),
+        }
+
+        if multi_pred_label in rec_map:
+            recommendation_text = rec_map[multi_pred_label]
+        else:
+            recommendation_text = (
+                "Виявлено певні зміни за даними моделі. "
+                "Рекомендовано звернутися до офтальмолога для клінічного огляду "
+                "та підтвердження або спростування діагнозу."
+            )
+
+    
+        if att is not None and pathology_flag:
+            att_mat = torch.stack(att)       
+            att_mat = att_mat.squeeze(1)      
+            L, H, T, _ = att_mat.shape
+            att_mat = att_mat.mean(dim=1)     
+
+            eye = torch.eye(T, device=att_mat.device)
+            att_mat = att_mat + eye[None, :, :]
+            att_mat = att_mat / att_mat.sum(dim=-1, keepdim=True)
+
+            joint_att = att_mat[0]
+            for i in range(1, L):
+                joint_att = att_mat[i] @ joint_att
+
+            v = joint_att[0, 1:]
+            num_patches = v.shape[0]
+            size = int(num_patches ** 0.5)
+            v = v.reshape(size, size).detach().cpu().numpy()
+            v = v / (v.max() + 1e-6)
+
+            overlay = overlay_heatmap(image, v, alpha=0.45)
+            attention_b64 = pil_to_base64(overlay)
+
+        return render_template_string(
+            TEMPLATE,
+            result_available=True,
+            original_image=original_b64,
+            attention_image=attention_b64,
+            prob_no_pathology=f"{prob_no_path:.3f}",
+            prob_pathology=f"{prob_path:.3f}",
+            pathology_flag=pathology_flag,
+            multi_pred_label=multi_pred_label,
+            multi_pred_prob=f"{multi_pred_prob:.3f}" if multi_pred_prob is not None else None,
+            multi_probs=multi_probs_list,
+            multi_pred_idx=multi_pred_idx,
+            recommendation_text=recommendation_text,
+        )
+
+    return render_template_string(TEMPLATE, result_available=False)
+
+def run_app():
+    app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False)
+
+thread = threading.Thread(target=run_app, daemon=True)
+thread.start()
+
+print("Система запущена, отримую зовнішню URL Colab...")
+url = eval_js("google.colab.kernel.proxyPort(8000)")
+print("Відкрий у новій вкладці браузера цю адресу:")
+print(url)
